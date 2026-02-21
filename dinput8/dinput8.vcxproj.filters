@@ -36,6 +36,9 @@
     <ClInclude Include="DirectInputModuleManager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="InputBridgeShm.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\minhook\src\buffer.h">
       <Filter>InputHook</Filter>
     </ClInclude>
@@ -87,6 +90,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="dinput8.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="InputBridgeShm.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="dllmain.cpp">

@@ -15,6 +15,7 @@
 #include "Utils.h"
 #include "DirectInputModuleManager.h"
 #include "SimpleIni.h"
+#include "InputBridgeShm.h"
 
 using namespace std;
 
@@ -29,6 +30,23 @@ HRESULT(STDMETHODCALLTYPE *TrueEnumDevicesA) (LPDIRECTINPUT8A This, DWORD dwDevT
 HRESULT(STDMETHODCALLTYPE *TrueEnumDevicesW) (LPDIRECTINPUT8W This, DWORD dwDevType, LPDIENUMDEVICESCALLBACKW lpCallback, LPVOID pvRef, DWORD dwFlags) = nullptr;
 HRESULT(STDMETHODCALLTYPE *EnumDevicesA) (LPDIRECTINPUT8A This, DWORD dwDevType, LPDIENUMDEVICESCALLBACKA lpCallback, LPVOID pvRef, DWORD dwFlags) = nullptr;
 HRESULT(STDMETHODCALLTYPE *EnumDevicesW) (LPDIRECTINPUT8W This, DWORD dwDevType, LPDIENUMDEVICESCALLBACKW lpCallback, LPVOID pvRef, DWORD dwFlags) = nullptr;
+
+// --- Input Bridge: CreateDevice hooks ---
+HRESULT(STDMETHODCALLTYPE *TrueCreateDeviceA) (LPDIRECTINPUT8A This, REFGUID rguid, LPDIRECTINPUTDEVICE8A *lplpDirectInputDevice, LPUNKNOWN pUnkOuter) = nullptr;
+HRESULT(STDMETHODCALLTYPE *TrueCreateDeviceW) (LPDIRECTINPUT8W This, REFGUID rguid, LPDIRECTINPUTDEVICE8W *lplpDirectInputDevice, LPUNKNOWN pUnkOuter) = nullptr;
+HRESULT(STDMETHODCALLTYPE *CreateDevicePtrA) (LPDIRECTINPUT8A This, REFGUID rguid, LPDIRECTINPUTDEVICE8A *lplpDirectInputDevice, LPUNKNOWN pUnkOuter) = nullptr;
+HRESULT(STDMETHODCALLTYPE *CreateDevicePtrW) (LPDIRECTINPUT8W This, REFGUID rguid, LPDIRECTINPUTDEVICE8W *lplpDirectInputDevice, LPUNKNOWN pUnkOuter) = nullptr;
+
+// --- Input Bridge: GetDeviceState hook (same binary signature for A and W) ---
+HRESULT(STDMETHODCALLTYPE *TrueGetDeviceState) (LPDIRECTINPUTDEVICE8A This, DWORD cbData, LPVOID lpvData) = nullptr;
+HRESULT(STDMETHODCALLTYPE *GetDeviceStateFnPtr) (LPDIRECTINPUTDEVICE8A This, DWORD cbData, LPVOID lpvData) = nullptr;
+
+// --- Input Bridge: globals ---
+static BridgeConfig g_bridgeConfig;
+static InputBridgeShm g_bridgeShm;
+static LPVOID g_bridgeTargetDevice = nullptr;
+static bool g_getDeviceStateHooked = false;
+static bool g_bridgeConfigLoaded = false;
 
 struct EnumCallbackUserData {
 	void* di;
@@ -190,6 +208,37 @@ vector<string> & ignoredProcessesA()
 	}
 
 	return result;
+}
+
+BridgeConfig loadBridgeConfig()
+{
+	BridgeConfig config;
+	CSimpleIniW ini;
+	ini.SetAllowEmptyValues(false);
+	wstring inipath(L"devreorder.ini");
+	SI_Error err = ini.LoadFile(inipath.c_str());
+
+	if (err < 0) {
+		CheckCommonDirectory(&inipath, L"devreorder");
+		err = ini.LoadFile(inipath.c_str());
+	}
+
+	if (err < 0) return config;
+
+	const wchar_t* deviceName = ini.GetValue(L"bridge", L"DeviceName", nullptr);
+	const wchar_t* enabled = ini.GetValue(L"bridge", L"Enabled", L"0");
+
+	if (deviceName && wcslen(deviceName) > 0) {
+		config.configured = true;
+		config.deviceName = deviceName;
+		config.enabled = (_wtoi(enabled) != 0);
+		PrintLog("InputBridge: [bridge] config loaded - DeviceName=%s, Enabled=%d",
+			UTF16ToUTF8(config.deviceName).c_str(), config.enabled ? 1 : 0);
+	} else {
+		PrintLog("InputBridge: No [bridge] section found, bridge disabled");
+	}
+
+	return config;
 }
 
 template <class T>
@@ -624,6 +673,117 @@ HRESULT STDMETHODCALLTYPE HookEnumDevicesW(LPDIRECTINPUT8W This, DWORD dwDevType
 	return result;
 }
 
+// --- Input Bridge: GetDeviceState hook ---
+// Called for ALL DirectInput devices (vtable hooking is global).
+// Only injects for the bridge target device; all others pass through.
+HRESULT STDMETHODCALLTYPE HookGetDeviceState(LPDIRECTINPUTDEVICE8A This, DWORD cbData, LPVOID lpvData)
+{
+	if ((LPVOID)This == g_bridgeTargetDevice) {
+		if (g_bridgeShm.TryConnect()) {
+			DIJOYSTATE2 injectedState;
+			if (g_bridgeShm.ReadState(&injectedState)) {
+				// Copy appropriate amount: DIJOYSTATE (80 bytes) or DIJOYSTATE2 (272 bytes)
+				DWORD copySize = min(cbData, (DWORD)sizeof(DIJOYSTATE2));
+				memcpy(lpvData, &injectedState, copySize);
+				return DI_OK;
+			}
+		}
+	}
+
+	return TrueGetDeviceState(This, cbData, lpvData);
+}
+
+// Install GetDeviceState hook from any device's vtable.
+// Only needs to be called once (all devices share the same vtable implementation).
+void InstallGetDeviceStateHook(LPVOID pDevice)
+{
+	if (g_getDeviceStateHooked) return;
+
+	// Cast to A version — binary layout of GetDeviceState is identical
+	// for A and W (no string parameters in the function signature)
+	LPDIRECTINPUTDEVICE8A pDeviceA = (LPDIRECTINPUTDEVICE8A)pDevice;
+
+	if (pDeviceA->lpVtbl->GetDeviceState) {
+		GetDeviceStateFnPtr = pDeviceA->lpVtbl->GetDeviceState;
+		IH_CreateHook(GetDeviceStateFnPtr, HookGetDeviceState, &TrueGetDeviceState);
+		IH_EnableHook(GetDeviceStateFnPtr);
+		g_getDeviceStateHooked = true;
+		PrintLog("InputBridge: GetDeviceState hook installed");
+	}
+}
+
+// --- Input Bridge: CreateDevice hooks ---
+// Intercepts device creation to identify the bridge target by product name
+// and install the GetDeviceState hook.
+HRESULT STDMETHODCALLTYPE HookCreateDeviceA(LPDIRECTINPUT8A This, REFGUID rguid,
+	LPDIRECTINPUTDEVICE8A *lplpDirectInputDevice, LPUNKNOWN pUnkOuter)
+{
+	HRESULT hr = TrueCreateDeviceA(This, rguid, lplpDirectInputDevice, pUnkOuter);
+	if (FAILED(hr) || !lplpDirectInputDevice || !*lplpDirectInputDevice) return hr;
+	if (!g_bridgeConfig.configured || !g_bridgeConfig.enabled) return hr;
+
+	LPDIRECTINPUTDEVICE8A pDevice = *lplpDirectInputDevice;
+
+	// Install GetDeviceState hook from the first device we see
+	if (!g_getDeviceStateHooked) {
+		InstallGetDeviceStateHook((LPVOID)pDevice);
+	}
+
+	// Check if this device matches the bridge target by product name
+	// DIPROPSTRING always uses WCHAR regardless of A/W interface
+	DIPROPSTRING dps = {};
+	dps.diph.dwSize = sizeof(DIPROPSTRING);
+	dps.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+	dps.diph.dwHow = DIPH_DEVICE;
+	dps.diph.dwObj = 0;
+
+	if (SUCCEEDED(IDirectInputDevice_GetProperty(pDevice, DIPROP_PRODUCTNAME, &dps.diph))) {
+		wstring productName = trim(wstring(dps.wsz));
+
+		if (productName == g_bridgeConfig.deviceName) {
+			g_bridgeTargetDevice = (LPVOID)pDevice;
+			PrintLog("InputBridge: Matched bridge target device: %s",
+				UTF16ToUTF8(productName).c_str());
+		}
+	}
+
+	return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateDeviceW(LPDIRECTINPUT8W This, REFGUID rguid,
+	LPDIRECTINPUTDEVICE8W *lplpDirectInputDevice, LPUNKNOWN pUnkOuter)
+{
+	HRESULT hr = TrueCreateDeviceW(This, rguid, lplpDirectInputDevice, pUnkOuter);
+	if (FAILED(hr) || !lplpDirectInputDevice || !*lplpDirectInputDevice) return hr;
+	if (!g_bridgeConfig.configured || !g_bridgeConfig.enabled) return hr;
+
+	LPDIRECTINPUTDEVICE8W pDevice = *lplpDirectInputDevice;
+
+	// Install GetDeviceState hook from the first device we see
+	if (!g_getDeviceStateHooked) {
+		InstallGetDeviceStateHook((LPVOID)pDevice);
+	}
+
+	// Check if this device matches the bridge target
+	DIPROPSTRING dps = {};
+	dps.diph.dwSize = sizeof(DIPROPSTRING);
+	dps.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+	dps.diph.dwHow = DIPH_DEVICE;
+	dps.diph.dwObj = 0;
+
+	if (SUCCEEDED(IDirectInputDevice_GetProperty(pDevice, DIPROP_PRODUCTNAME, &dps.diph))) {
+		wstring productName = trim(wstring(dps.wsz));
+
+		if (productName == g_bridgeConfig.deviceName) {
+			g_bridgeTargetDevice = (LPVOID)pDevice;
+			PrintLog(L"InputBridge: Matched bridge target device: %s",
+				productName.c_str());
+		}
+	}
+
+	return hr;
+}
+
 void CreateHooks(REFIID riidltf, LPVOID *realDI)
 {
 	PrintLog("devreorder: in CreateHooks");
@@ -631,6 +791,12 @@ void CreateHooks(REFIID riidltf, LPVOID *realDI)
 	if (currentProcessIsIgnored()) {
 		PrintLog("... current process is ignored, not hooking into DirectInput");
 		return;
+	}
+
+	// Load bridge config once
+	if (!g_bridgeConfigLoaded) {
+		g_bridgeConfig = loadBridgeConfig();
+		g_bridgeConfigLoaded = true;
 	}
 
 	if (IsEqualIID(riidltf, IID_IDirectInput8A))
@@ -645,6 +811,14 @@ void CreateHooks(REFIID riidltf, LPVOID *realDI)
 				EnumDevicesA = pDIA->lpVtbl->EnumDevices;
 				IH_CreateHook(EnumDevicesA, HookEnumDevicesA, &TrueEnumDevicesA);
 				IH_EnableHook(EnumDevicesA);
+			}
+
+			// Hook CreateDevice for Input Bridge device matching
+			if (pDIA->lpVtbl->CreateDevice && g_bridgeConfig.configured)
+			{
+				CreateDevicePtrA = pDIA->lpVtbl->CreateDevice;
+				IH_CreateHook(CreateDevicePtrA, HookCreateDeviceA, &TrueCreateDeviceA);
+				IH_EnableHook(CreateDevicePtrA);
 			}
 		}
 	}
@@ -661,6 +835,14 @@ void CreateHooks(REFIID riidltf, LPVOID *realDI)
 				EnumDevicesW = pDIW->lpVtbl->EnumDevices;
 				IH_CreateHook(EnumDevicesW, HookEnumDevicesW, &TrueEnumDevicesW);
 				IH_EnableHook(EnumDevicesW);
+			}
+
+			// Hook CreateDevice for Input Bridge device matching
+			if (pDIW->lpVtbl->CreateDevice && g_bridgeConfig.configured)
+			{
+				CreateDevicePtrW = pDIW->lpVtbl->CreateDevice;
+				IH_CreateHook(CreateDevicePtrW, HookCreateDeviceW, &TrueCreateDeviceW);
+				IH_EnableHook(CreateDevicePtrW);
 			}
 		}
 	}
